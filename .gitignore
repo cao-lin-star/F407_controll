@@ -1,0 +1,51 @@
+# IDE and user-local state
+/.vscode/
+/.idea/
+/.pio/
+**/.pytest_cache/
+**/__pycache__/
+*.py[cod]
+
+# Host, PlatformIO, CMake and temporary builds
+/build*/
+/build-host-wsl/
+/artifacts/
+/tmp/
+
+# Legacy STM32F103/PlatformIO migration material is not an F407 build entry.
+/platformio.ini
+/02_硬件选型与参数修改指南.md
+
+# Legacy F103 implementations; F407 keeps only the shared interfaces/core.
+/src/board.c
+/src/main.c
+/src/stm32f1xx_it.c
+/src/uart_transport.c
+
+
+# STM32CubeMX duplicate/legacy output (the active project uses F407/Core)
+/F407/.mxproject
+/F407/Inc/
+/F407/Src/
+
+# Keil generated output and per-user state
+/F407/MDK-ARM/Footbath_Chassis_F407/
+/F407/MDK-ARM/*.uvguix*
+/F407/MDK-ARM/*.uvoptx
+*.axf
+*.bin
+*.crf
+*.d
+*.dep
+*.elf
+*.hex
+*.htm
+*.lnp
+*.log
+*.lst
+*.map
+*.o
+*.obj
+*.sct
+*.bak
+*.tmp

@@ -1,0 +1,3 @@
+config load G:/work/ROS2/Chassis/F407/Footbath_Chassis_F407.ioc
+project generate
+exit

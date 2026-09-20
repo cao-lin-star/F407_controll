@@ -96,6 +96,8 @@ static void send_heartbeat(const chassis_control_t *state, uint32_t now_ms)
     protocol_write_u32_le(&payload[0], now_ms);
     protocol_write_u16_le(&payload[4], state->fault_flags);
     send_payload(MSG_HEARTBEAT, payload, sizeof(payload));
+    const uint8_t source = (uint8_t)state->active_source;
+    send_payload(MSG_CONTROL_SOURCE, &source, 1U);
     ++app_stats.heartbeat_frames;
 }
 
@@ -301,11 +303,19 @@ static void update_faults_from_statistics(uint32_t now_ms)
 
 static void update_safety_interlocks(void)
 {
+    sensor_snapshot_t safety_sensors;
+    sensor_hub_get_snapshot(&safety_sensors);
+    /* Cliff: never rotate toward an unsupported wheel. Only both-wheel
+     * reverse/zero is allowed until the ground flags clear. Front sonar
+     * protects positive translation; pure rotation remains available. */
+    const bool any_wheel_forward = chassis.debug_pwm_active
+        ? (chassis.debug_pwm_left_percent > 0.0f || chassis.debug_pwm_right_percent > 0.0f)
+        : (chassis.requested_left_mm_s > 0.0f || chassis.requested_right_mm_s > 0.0f);
     const bool forward_motion_requested = chassis.debug_pwm_active
-        ? (chassis.debug_pwm_left_percent > 0.0f
-           || chassis.debug_pwm_right_percent > 0.0f)
-        : (chassis.requested_left_mm_s > 0.0f
-           || chassis.requested_right_mm_s > 0.0f);
+        ? ((chassis.debug_pwm_left_percent
+            + chassis.debug_pwm_right_percent) > 0.0f)
+        : ((chassis.requested_left_mm_s
+            + chassis.requested_right_mm_s) > 0.0f);
 
     if (board_estop_active()) {
         ps2_remote_force_stop();
@@ -313,7 +323,9 @@ static void update_safety_interlocks(void)
     } else {
         control_clear_fault(&chassis, FAULT_ESTOP);
     }
-    if (forward_motion_requested && sensor_hub_obstacle_stop_required()) {
+    const bool cliff_blocked = CLIFF_SAFETY_ENABLE && any_wheel_forward
+        && (safety_sensors.obstacle_flags & (OBSTACLE_CLIFF_LEFT | OBSTACLE_CLIFF_RIGHT));
+    if (cliff_blocked || (forward_motion_requested && sensor_hub_obstacle_stop_required())) {
         ps2_remote_force_stop();
         control_raise_stop_fault(&chassis, FAULT_OBSTACLE);
     } else {

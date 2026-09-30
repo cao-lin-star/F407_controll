@@ -12,6 +12,7 @@
 #include "protocol.h"
 #include "ps2_remote.h"
 #include "sensor_hub.h"
+#include "side_ultrasonic_guard.h"
 #include "uart_transport.h"
 
 typedef struct {
@@ -27,6 +28,8 @@ typedef struct {
 } app_stats_t;
 
 static chassis_control_t chassis;
+/* RAM-only choice. A power cycle restores side protection. */
+static uint8_t side_ultrasonic_enabled = 1U;
 static chassis_control_t published_chassis;
 static protocol_parser_t parser;
 static volatile app_stats_t app_stats;
@@ -35,6 +38,7 @@ static uint16_t tx_sequence;
 static uint32_t next_control_ms;
 static uint32_t next_odom_ms;
 static uint32_t next_heartbeat_ms;
+static uint32_t next_source_ms;
 static uint32_t next_range_ms;
 static uint32_t next_imu_ms;
 static uint32_t next_debug_ms;
@@ -96,8 +100,6 @@ static void send_heartbeat(const chassis_control_t *state, uint32_t now_ms)
     protocol_write_u32_le(&payload[0], now_ms);
     protocol_write_u16_le(&payload[4], state->fault_flags);
     send_payload(MSG_HEARTBEAT, payload, sizeof(payload));
-    const uint8_t source = (uint8_t)state->active_source;
-    send_payload(MSG_CONTROL_SOURCE, &source, 1U);
     ++app_stats.heartbeat_frames;
 }
 
@@ -114,6 +116,16 @@ static void send_range_status(void)
     protocol_write_u16_le(&payload[14], sensors.obstacle_flags
                                       | (uint16_t)(sensors.sensor_fault_flags << 8U));
     send_payload(MSG_RANGE_STATUS, payload, sizeof(payload));
+    /* Additive telemetry; never change the existing 0x05 payload. */
+    uint8_t three[36] = {0};
+    for (unsigned i = 0; i < 3U; ++i) {
+        protocol_write_f32_le(&three[i * 12U], sensors.ultrasonic_three_m[i]);
+        protocol_write_u32_le(&three[i * 12U + 4U], sensors.ultrasonic_age_ms[i]);
+        protocol_write_u16_le(&three[i * 12U + 8U], sensors.ultrasonic_sequence[i]);
+        three[i * 12U + 10U] = sensors.ultrasonic_status[i];
+    }
+    send_payload(MSG_ULTRASONIC_THREE, three, sizeof(three));
+    send_payload(MSG_SIDE_ULTRASONIC_STATE, &side_ultrasonic_enabled, 1U);
     ++app_stats.range_frames;
 }
 
@@ -217,6 +229,22 @@ static void process_frame(const protocol_frame_t *frame, uint32_t now_ms)
 {
     app_stats.last_rx_seq = frame->seq;
     switch (frame->msg_type) {
+    case MSG_SIDE_ULTRASONIC_CONFIG:
+        if (frame->payload_len == 2U && frame->payload[0] == 1U
+            && frame->payload[1] <= 1U) {
+            /* Never change protection while another source is moving. */
+            if (!chassis.debug_pwm_active
+                && fabsf(chassis.requested_left_mm_s) < 0.1f
+                && fabsf(chassis.requested_right_mm_s) < 0.1f
+                && fabsf(chassis.measured_left_mm_s) < 2.0f
+                && fabsf(chassis.measured_right_mm_s) < 2.0f
+                && fabsf(chassis.output_left_percent) < 0.1f
+                && fabsf(chassis.output_right_percent) < 0.1f) {
+                side_ultrasonic_enabled = frame->payload[1];
+            }
+            send_payload(MSG_SIDE_ULTRASONIC_STATE, &side_ultrasonic_enabled, 1U);
+        }
+        break;
     case MSG_CMD_VEL:
         if (frame->payload_len == 8U) {
             const float linear_mps = protocol_read_f32_le(&frame->payload[0]);
@@ -325,7 +353,25 @@ static void update_safety_interlocks(void)
     }
     const bool cliff_blocked = CLIFF_SAFETY_ENABLE && any_wheel_forward
         && (safety_sensors.obstacle_flags & (OBSTACLE_CLIFF_LEFT | OBSTACLE_CLIFF_RIGHT));
-    if (cliff_blocked || (forward_motion_requested && sensor_hub_obstacle_stop_required())) {
+    bool side_blocked = false;
+    if (SIDE_ULTRASONIC_SAFETY_ENABLE && side_ultrasonic_enabled) {
+        /* Open-loop PWM has no speed setpoint: use the configured worst-case
+         * wheel speed, never interpret PWM percent as measured velocity. */
+        const float left = chassis.debug_pwm_active
+            ? (chassis.debug_pwm_left_percent > 0 ? MAX_LINEAR_MPS :
+               chassis.debug_pwm_left_percent < 0 ? -MAX_LINEAR_MPS : 0)
+            : chassis.requested_left_mm_s * 0.001f;
+        const float right = chassis.debug_pwm_active
+            ? (chassis.debug_pwm_right_percent > 0 ? MAX_LINEAR_MPS :
+               chassis.debug_pwm_right_percent < 0 ? -MAX_LINEAR_MPS : 0)
+            : chassis.requested_right_mm_s * 0.001f;
+        for (unsigned i = 1; i < 3; ++i) {
+            side_blocked |= side_ultrasonic_blocked(safety_sensors.ultrasonic_three_m[i],
+                safety_sensors.ultrasonic_status[i], safety_sensors.ultrasonic_age_ms[i],
+                i == 1, left, right);
+        }
+    }
+    if (cliff_blocked || side_blocked || (forward_motion_requested && sensor_hub_obstacle_stop_required())) {
         ps2_remote_force_stop();
         control_raise_stop_fault(&chassis, FAULT_OBSTACLE);
     } else {
@@ -375,6 +421,7 @@ void chassis_app_init(void)
     next_control_ms = now_ms + CONTROL_PERIOD_MS;
     next_odom_ms = now_ms + ODOM_PERIOD_MS;
     next_heartbeat_ms = now_ms + HEARTBEAT_PERIOD_MS;
+    next_source_ms = now_ms + CONTROL_SOURCE_PERIOD_MS;
     next_range_ms = now_ms + RANGE_STATUS_PERIOD_MS;
     next_imu_ms = now_ms + IMU_PERIOD_MS;
     next_debug_ms = now_ms + DEBUG_STATUS_PERIOD_MS;
@@ -455,6 +502,11 @@ void chassis_app_telemetry_process(uint32_t now_ms)
     if ((int32_t)(now_ms - next_debug_ms) >= 0) {
         next_debug_ms += DEBUG_STATUS_PERIOD_MS;
         send_debug_status(&state, now_ms);
+    }
+    if ((int32_t)(now_ms - next_source_ms) >= 0) {
+        next_source_ms = now_ms + CONTROL_SOURCE_PERIOD_MS;
+        const uint8_t source = (uint8_t)state.active_source;
+        send_payload(MSG_CONTROL_SOURCE, &source, 1U);
     }
     if ((int32_t)(now_ms - next_heartbeat_ms) >= 0) {
         next_heartbeat_ms += HEARTBEAT_PERIOD_MS;

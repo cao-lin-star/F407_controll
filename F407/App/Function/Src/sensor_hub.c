@@ -4,6 +4,7 @@
 #include <string.h>
 
 #include "board_config.h"
+#include "ultrasonic_measure.h"
 #include "i2c.h"
 #include "main.h"
 #include "tim.h"
@@ -42,6 +43,7 @@ typedef struct {
     uint16_t expected_length;
     uint8_t rx_byte;
     uint32_t last_update_ms;
+    uint32_t last_frame_ms;
     uint32_t checksum_errors;
     uint32_t format_errors;
 } tofsense_parser_t;
@@ -68,7 +70,16 @@ static tofsense_rx_ring_t tof_right_rx;
 static uint32_t next_imu_ms;
 #if ULTRASONIC_PROTOCOL_MODE == ULTRASONIC_MODE_TRIGGER_ECHO
 static uint32_t next_ultrasonic_trigger_ms;
+static const uint32_t us_channels[3] = {TIM_CHANNEL_1, TIM_CHANNEL_2, TIM_CHANNEL_3};
+static const uint32_t us_active_channels[3] = {HAL_TIM_ACTIVE_CHANNEL_1, HAL_TIM_ACTIVE_CHANNEL_2, HAL_TIM_ACTIVE_CHANNEL_3};
+static const uint16_t us_trig_pins[3] = {GPIO_PIN_0, GPIO_PIN_1, GPIO_PIN_2};
+static const uint8_t us_schedule[4] = {0,1,0,2};
+static volatile uint8_t us_index;
+static uint8_t us_slot;
+static uint32_t us_stamp[3];
 static volatile uint16_t ultrasonic_rising_us;
+static volatile uint32_t ultrasonic_rising_ms;
+static volatile uint8_t ultrasonic_long_pulse;
 static volatile uint16_t ultrasonic_captured_pulse_us;
 static uint32_t ultrasonic_last_update_ms;
 static uint32_t ultrasonic_measurement_started_ms;
@@ -349,6 +360,7 @@ static void tofsense_accept_frame(tofsense_parser_t *parser,
     uint8_t i;
 
     ++(*frame_count_out);
+    parser->last_frame_ms = HAL_GetTick();
     *zone_count_out = zone_count;
     minimum_valid = zone_count == TOFSENSE_ZONES_4X4
                   ? TOFSENSE_MIN_VALID_ZONES_4X4
@@ -369,6 +381,7 @@ static void tofsense_accept_frame(tofsense_parser_t *parser,
 
     *valid_zones_out = valid_count;
     if (valid_count < minimum_valid) {
+        snapshot.valid_flags &= (uint16_t)~valid_bit;
         snapshot.sensor_fault_flags |= fault_bit;
         return;
     }
@@ -537,9 +550,9 @@ static uint16_t update_cliff_flag(uint16_t flags,
         return (uint16_t)(flags & (uint16_t)~flag);
 #endif
     }
-    if (distance_m >= ground_baseline_m + CLIFF_STOP_MARGIN_M) {
+    if (distance_m >= CLIFF_STOP_DISTANCE_M) {
         flags |= flag;
-    } else if (distance_m <= ground_baseline_m + CLIFF_CLEAR_MARGIN_M) {
+    } else if (distance_m <= CLIFF_CLEAR_DISTANCE_M) {
         flags &= (uint16_t)~flag;
     }
     return flags;
@@ -586,6 +599,11 @@ static void update_obstacle_flags(void)
 #if ULTRASONIC_PROTOCOL_MODE == ULTRASONIC_MODE_TRIGGER_ECHO
 static void ultrasonic_publish_clear(uint32_t now_ms)
 {
+    snapshot.ultrasonic_three_m[us_index] = ULTRASONIC_MAX_DISTANCE_M;
+    snapshot.ultrasonic_status[us_index] = 2U;
+    ++snapshot.ultrasonic_sequence[us_index];
+    us_stamp[us_index] = now_ms;
+    if (us_index != 0U) return;
     /* HC-SR04-class modules report an open/out-of-range scene as no echo.
      * Publish the finite maximum range so the RK costmap can ray-clear to the
      * sensor limit. The UART protocol deliberately rejects NaN/Inf. */
@@ -597,6 +615,10 @@ static void ultrasonic_publish_clear(uint32_t now_ms)
 
 static void ultrasonic_publish_fault(void)
 {
+    snapshot.ultrasonic_status[us_index] = 3U;
+    ++snapshot.ultrasonic_sequence[us_index];
+    us_stamp[us_index] = HAL_GetTick();
+    if (us_index != 0U) return;
     snapshot.valid_flags &= (uint16_t)~RANGE_VALID_ULTRASONIC;
     snapshot.sensor_fault_flags |= SENSOR_FAULT_ULTRASONIC;
 }
@@ -606,18 +628,26 @@ static void ultrasonic_start_measurement(uint32_t now_ms)
     uint32_t primask;
     uint16_t trigger_started_us;
 
+    GPIO_TypeDef *echo_port = us_index == 0U ? GPIOB : GPIOD;
+    const uint16_t echo_pin = us_index == 0U ? GPIO_PIN_6 : (us_index == 1U ? GPIO_PIN_13 : GPIO_PIN_14);
+    if (HAL_GPIO_ReadPin(echo_port, echo_pin) == GPIO_PIN_SET) {
+        ultrasonic_publish_fault();
+        return; /* Stuck high before trigger is not open space. */
+    }
+
     primask = enter_critical();
     ultrasonic_measurement_pending = 1U;
     ultrasonic_wait_falling = 0U;
     ultrasonic_pulse_ready = 0U;
+    ultrasonic_long_pulse = 0U;
     __HAL_TIM_SET_CAPTUREPOLARITY(&htim4,
-                                  TIM_CHANNEL_1,
+                                  us_channels[us_index],
                                   TIM_INPUTCHANNELPOLARITY_RISING);
     leave_critical(primask);
 
     ultrasonic_measurement_started_ms = now_ms;
     HAL_GPIO_WritePin(ULTRASONIC_TRIG_GPIO_Port,
-                      ULTRASONIC_TRIG_Pin,
+                      us_trig_pins[us_index],
                       GPIO_PIN_SET);
     trigger_started_us = (uint16_t)__HAL_TIM_GET_COUNTER(&htim4);
     /* The sensor service runs every 2 ms, so deferring this edge to the next
@@ -629,7 +659,7 @@ static void ultrasonic_start_measurement(uint32_t now_ms)
         /* bounded hardware-timer wait */
     }
     HAL_GPIO_WritePin(ULTRASONIC_TRIG_GPIO_Port,
-                      ULTRASONIC_TRIG_Pin,
+                      us_trig_pins[us_index],
                       GPIO_PIN_RESET);
 }
 
@@ -651,17 +681,24 @@ static void ultrasonic_process_measurement(uint32_t now_ms)
     leave_critical(primask);
 
     if (pulse_ready != 0U) {
-        distance_m = (float)pulse_us * 0.0001715f;
+        /* CS100A emits ~66ms for no target, exceeding TIM4's 65536us wrap. */
+        distance_m = ultrasonic_pulse_distance(pulse_us, ultrasonic_long_pulse ? 60U : 0U);
         if (distance_m < ULTRASONIC_MIN_DISTANCE_M) {
             /* A zero/very short pulse is electrical noise, not open space. */
             ultrasonic_publish_fault();
         } else if (distance_m > ULTRASONIC_MAX_DISTANCE_M) {
             ultrasonic_publish_clear(now_ms);
         } else {
-            snapshot.ultrasonic_m = distance_m;
-            ultrasonic_last_update_ms = now_ms;
-            snapshot.valid_flags |= RANGE_VALID_ULTRASONIC;
-            snapshot.sensor_fault_flags &= (uint16_t)~SENSOR_FAULT_ULTRASONIC;
+            snapshot.ultrasonic_three_m[us_index] = distance_m;
+            snapshot.ultrasonic_status[us_index] = 1U;
+            ++snapshot.ultrasonic_sequence[us_index];
+            us_stamp[us_index] = now_ms;
+            if (us_index == 0U) {
+                snapshot.ultrasonic_m = distance_m;
+                ultrasonic_last_update_ms = now_ms;
+                snapshot.valid_flags |= RANGE_VALID_ULTRASONIC;
+                snapshot.sensor_fault_flags &= (uint16_t)~SENSOR_FAULT_ULTRASONIC;
+            }
         }
         return;
     }
@@ -678,7 +715,7 @@ static void ultrasonic_process_measurement(uint32_t now_ms)
     ultrasonic_wait_falling = 0U;
     ultrasonic_pulse_ready = 0U;
     __HAL_TIM_SET_CAPTUREPOLARITY(&htim4,
-                                  TIM_CHANNEL_1,
+                                  us_channels[us_index],
                                   TIM_INPUTCHANNELPOLARITY_RISING);
     leave_critical(primask);
 
@@ -701,7 +738,7 @@ void sensor_hub_init(void)
     memset(&tof_right_rx, 0, sizeof(tof_right_rx));
 #endif
     HAL_GPIO_WritePin(ULTRASONIC_TRIG_GPIO_Port,
-                      ULTRASONIC_TRIG_Pin,
+                      us_trig_pins[us_index],
                       GPIO_PIN_RESET);
     mpu6050_init();
 
@@ -720,9 +757,14 @@ void sensor_hub_init(void)
     ultrasonic_wait_falling = 0U;
     ultrasonic_pulse_ready = 0U;
     __HAL_TIM_SET_CAPTUREPOLARITY(&htim4,
-                                  TIM_CHANNEL_1,
+                                  us_channels[us_index],
                                   TIM_INPUTCHANNELPOLARITY_RISING);
     (void)HAL_TIM_IC_Start_IT(&htim4, TIM_CHANNEL_1);
+    (void)HAL_TIM_IC_Start_IT(&htim4, TIM_CHANNEL_2);
+    (void)HAL_TIM_IC_Start_IT(&htim4, TIM_CHANNEL_3);
+    us_index = 0U;
+    us_slot = 0U;
+    memset(us_stamp, 0, sizeof(us_stamp));
 #else
     snapshot.sensor_fault_flags |= SENSOR_FAULT_US_UNVERIFIED;
 #endif
@@ -766,6 +808,11 @@ void sensor_hub_process(uint32_t now_ms)
 
 #if TOF_PROTOCOL_MODE == TOF_PROTOCOL_TOFSENSE_M
     const uint32_t tof_now_ms = HAL_GetTick();
+    snapshot.valid_flags &= (uint16_t)~(RANGE_TOF_LEFT_FRAME_FRESH | RANGE_TOF_RIGHT_FRAME_FRESH);
+    if (snapshot.tof_left_frames > 0U && tof_now_ms - tof_left.last_frame_ms <= SENSOR_DATA_TIMEOUT_MS)
+        snapshot.valid_flags |= RANGE_TOF_LEFT_FRAME_FRESH;
+    if (snapshot.tof_right_frames > 0U && tof_now_ms - tof_right.last_frame_ms <= SENSOR_DATA_TIMEOUT_MS)
+        snapshot.valid_flags |= RANGE_TOF_RIGHT_FRAME_FRESH;
     snapshot.tof_left_age_ms = tof_now_ms - tof_left.last_update_ms;
     snapshot.tof_right_age_ms = tof_now_ms - tof_right.last_update_ms;
     if ((snapshot.valid_flags & RANGE_VALID_TOF_LEFT) != 0U
@@ -786,6 +833,8 @@ void sensor_hub_process(uint32_t now_ms)
 
     if ((int32_t)(now_ms - next_ultrasonic_trigger_ms) >= 0
         && ultrasonic_measurement_pending == 0U) {
+        us_index = us_schedule[us_slot];
+        us_slot = (uint8_t)((us_slot + 1U) % 4U);
         ultrasonic_start_measurement(now_ms);
         next_ultrasonic_trigger_ms = now_ms + ULTRASONIC_TRIGGER_PERIOD_MS;
     }
@@ -798,6 +847,11 @@ void sensor_hub_process(uint32_t now_ms)
 #endif
 
     update_obstacle_flags();
+    for (unsigned i = 0; i < 3U; ++i) {
+        snapshot.ultrasonic_age_ms[i] = now_ms - us_stamp[i];
+        if (snapshot.ultrasonic_status[i] != 0U && snapshot.ultrasonic_age_ms[i] > 600U)
+            snapshot.ultrasonic_status[i] = 3U;
+    }
 }
 
 void sensor_hub_get_snapshot(sensor_snapshot_t *out)
@@ -874,28 +928,30 @@ void sensor_hub_on_tim_ic_capture(TIM_HandleTypeDef *timer)
 #if ULTRASONIC_PROTOCOL_MODE == ULTRASONIC_MODE_TRIGGER_ECHO
     uint16_t capture;
 
-    if (timer != &htim4 || timer->Channel != HAL_TIM_ACTIVE_CHANNEL_1) {
+    if (timer != &htim4 || timer->Channel != us_active_channels[us_index]) {
         return;
     }
     if (ultrasonic_measurement_pending == 0U
         || ultrasonic_pulse_ready != 0U) {
         return;
     }
-    capture = (uint16_t)HAL_TIM_ReadCapturedValue(timer, TIM_CHANNEL_1);
+    capture = (uint16_t)HAL_TIM_ReadCapturedValue(timer, us_channels[us_index]);
     if (ultrasonic_wait_falling == 0U) {
         ultrasonic_rising_us = capture;
+        ultrasonic_rising_ms = HAL_GetTick();
         ultrasonic_wait_falling = 1U;
         __HAL_TIM_SET_CAPTUREPOLARITY(timer,
-                                      TIM_CHANNEL_1,
+                                      us_channels[us_index],
                                       TIM_INPUTCHANNELPOLARITY_FALLING);
         return;
     }
 
     ultrasonic_captured_pulse_us = (uint16_t)(capture - ultrasonic_rising_us);
+    ultrasonic_long_pulse = (HAL_GetTick() - ultrasonic_rising_ms >= 60U) ? 1U : 0U;
     ultrasonic_wait_falling = 0U;
     ultrasonic_pulse_ready = 1U;
     __HAL_TIM_SET_CAPTUREPOLARITY(timer,
-                                  TIM_CHANNEL_1,
+                                  us_channels[us_index],
                                   TIM_INPUTCHANNELPOLARITY_RISING);
 #else
     (void)timer;

@@ -10,7 +10,9 @@ enum {
     RANGE_VALID_TOF_LEFT   = (1U << 0),
     RANGE_VALID_TOF_RIGHT  = (1U << 1),
     RANGE_VALID_ULTRASONIC = (1U << 2),
-    RANGE_VALID_IMU        = (1U << 3)
+    RANGE_VALID_IMU        = (1U << 3),
+    RANGE_TOF_LEFT_FRAME_FRESH  = (1U << 4),
+    RANGE_TOF_RIGHT_FRAME_FRESH = (1U << 5)
 };
 
 enum {
@@ -38,6 +40,11 @@ typedef struct {
     float tof_left_m;
     float tof_right_m;
     float ultrasonic_m;
+    /* front/left/right; 0=uninitialized,1=echo,2=no echo,3=fault */
+    float ultrasonic_three_m[3];
+    uint32_t ultrasonic_age_ms[3];
+    uint16_t ultrasonic_sequence[3];
+    uint8_t ultrasonic_status[3];
     float accel_x_mps2;
     float accel_y_mps2;
     float accel_z_mps2;

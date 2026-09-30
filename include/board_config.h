@@ -2,7 +2,9 @@
 #define BOARD_CONFIG_H
 
 /* Active target: STM32F407ZGT6. Pin assignments live in the CubeMX .ioc. */
-#if defined(STM32F407xx)
+#if defined(FOOTBATH_HOST_TEST)
+/* Portable safety/geometry tests do not use peripheral registers. */
+#elif defined(STM32F407xx)
 #include "stm32f4xx_hal.h"
 #else
 #include "stm32f1xx_hal.h" /* Legacy F103 PlatformIO target. */
@@ -20,6 +22,7 @@
 #define IMU_PERIOD_MS                        20U
 #define DEBUG_STATUS_PERIOD_MS              200U
 #define HEARTBEAT_PERIOD_MS                1000U
+#define CONTROL_SOURCE_PERIOD_MS            100U
 #define CMD_VEL_TIMEOUT_MS                  500U
 #define WHEEL_ACCEL_LIMIT_MPS2               0.30f
 #define WHEEL_DECEL_LIMIT_MPS2               0.50f
@@ -116,11 +119,15 @@
 #define IR_OBSTACLE_SAFETY_ENABLE                 0U
 #define FRONT_OBSTACLE_STOP_DISTANCE_M          0.20f
 #define FRONT_OBSTACLE_CLEAR_DISTANCE_M         0.28f
+/* Side sonar: preserve 80 ms front/left/front/right polling. */
+#define SIDE_ULTRASONIC_SAFETY_ENABLE              1U
+#define SIDE_ULTRASONIC_TIMEOUT_MS              600U
+#define SIDE_ULTRASONIC_STOP_DISTANCE_M          0.12f
 #define CLIFF_SAFETY_ENABLE                       1U
 #define CLIFF_LEFT_GROUND_BASELINE_M             0.155f
 #define CLIFF_RIGHT_GROUND_BASELINE_M            0.160f
-#define CLIFF_STOP_MARGIN_M                      0.06f
-#define CLIFF_CLEAR_MARGIN_M                     0.04f
+#define CLIFF_STOP_DISTANCE_M                    0.28f /* Absolute probe distance, both sides. */
+#define CLIFF_CLEAR_DISTANCE_M                   0.26f /* 2 cm hysteresis. */
 #define CLIFF_FAIL_SAFE_ON_TIMEOUT                 1U
 #define SENSOR_DATA_TIMEOUT_MS                   250U
 

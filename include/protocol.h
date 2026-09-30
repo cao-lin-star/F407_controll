@@ -21,6 +21,9 @@ typedef enum {
     MSG_RANGE_STATUS = 0x05,
     MSG_IMU_RAW      = 0x06,
     MSG_CONTROL_SOURCE = 0x07, /* one byte: NONE/RK/DEBUG/PS2 */
+    MSG_ULTRASONIC_THREE = 0x08, /* 36 bytes, observation only */
+    MSG_SIDE_ULTRASONIC_CONFIG = 0x09, /* [version=1, enabled=0/1] */
+    MSG_SIDE_ULTRASONIC_STATE = 0x0A, /* [actual enabled=0/1] */
     MSG_DEBUG_STATUS = 0x7F
 } protocol_msg_type_t;
 

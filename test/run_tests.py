@@ -213,7 +213,7 @@ def test_loaded_pid_tof_and_directional_safety_contract() -> None:
         re.DOTALL,
     )
     assert insufficient_zones is not None
-    assert "snapshot.valid_flags &= " not in insufficient_zones.group(0)
+    assert "snapshot.valid_flags &= (uint16_t)~valid_bit" in insufficient_zones.group(0)
     assert "SENSOR_DATA_TIMEOUT_MS" in process.group(0)
     assert "const uint32_t tof_now_ms = HAL_GetTick();" in process.group(0)
     assert "tof_now_ms - tof_left.last_update_ms" in process.group(0)
@@ -260,9 +260,13 @@ def test_ultrasonic_out_of_range_and_isr_contract() -> None:
     assert start is not None
     assert publish_clear is not None
 
-    # The capture ISR may only record timer edges/pulse width.
-    for forbidden in ("float ", "HAL_GetTick", "snapshot."):
+    # Edge capture also reads the nonblocking millisecond counter to distinguish
+    # ~66ms no-target pulses from the 16-bit timer wrap. No delays, floating
+    # point conversion, or snapshot publication belong in this ISR.
+    for forbidden in ("float ", "HAL_Delay", "osDelay", "snapshot."):
         assert forbidden not in callback.group(0)
+    assert callback.group(0).count("HAL_GetTick()") == 2
+    assert "ultrasonic_long_pulse" in callback.group(0)
     assert "ultrasonic_captured_pulse_us" in callback.group(0)
     assert "ultrasonic_pulse_ready = 1U;" in callback.group(0)
 

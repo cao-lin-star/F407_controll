@@ -159,7 +159,8 @@ bool control_accept_cmd_vel_from(chassis_control_t *control,
         if (!velocity_is_neutral(linear_mps, angular_rps)) {
             control->recovery_neutral_seen = false;
             control->encoder_recovery_since_ms = 0U;
-            control_add_fault(control, FAULT_INVALID_COMMAND);
+            /* Valid motion during protection is refused, not malformed.
+             * Require a new neutral handshake; retain the original fault. */
             control_stop(control, true);
             return false;
         }
@@ -235,7 +236,8 @@ bool control_accept_debug_pwm_from(chassis_control_t *control,
 
             control->recovery_neutral_seen = false;
             control->encoder_recovery_since_ms = 0U;
-            control_add_fault(control, FAULT_INVALID_COMMAND);
+            /* Valid motion during protection is refused, not malformed.
+             * Require a new neutral handshake; retain the original fault. */
             control_stop(control, true);
             return false;
         }
@@ -319,8 +321,8 @@ void control_request_fault_recovery(chassis_control_t *control)
 
 static bool encoder_delta_is_stable(int32_t delta_ticks)
 {
-    return delta_ticks <= ENCODER_RECOVERY_MAX_DELTA_PER_PERIOD
-        && delta_ticks >= -ENCODER_RECOVERY_MAX_DELTA_PER_PERIOD;
+    return delta_ticks <= (int32_t)ENCODER_RECOVERY_MAX_DELTA_PER_PERIOD
+        && delta_ticks >= -(int32_t)ENCODER_RECOVERY_MAX_DELTA_PER_PERIOD;
 }
 
 static bool update_stall_timer(uint32_t *since_ms,

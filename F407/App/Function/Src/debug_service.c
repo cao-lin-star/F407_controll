@@ -163,6 +163,16 @@ static void send_telemetry(const chassis_control_t *chassis, uint32_t now_ms)
     if (length > 0 && (size_t)length < sizeof(line)) {
         (void)debug_console_send(line);
     }
+    length = snprintf(line, sizeof(line),
+        "US3,front_mm=%ld,left_mm=%ld,right_mm=%ld,status_f=%u,status_l=%u,status_r=%u,age_f=%lu,age_l=%lu,age_r=%lu,seq_f=%u,seq_l=%u,seq_r=%u\r\n",
+        (long)scaled_i32(sensors.ultrasonic_three_m[0],1000.0f),
+        (long)scaled_i32(sensors.ultrasonic_three_m[1],1000.0f),
+        (long)scaled_i32(sensors.ultrasonic_three_m[2],1000.0f),
+        sensors.ultrasonic_status[0],sensors.ultrasonic_status[1],sensors.ultrasonic_status[2],
+        (unsigned long)sensors.ultrasonic_age_ms[0],(unsigned long)sensors.ultrasonic_age_ms[1],
+        (unsigned long)sensors.ultrasonic_age_ms[2],sensors.ultrasonic_sequence[0],
+        sensors.ultrasonic_sequence[1],sensors.ultrasonic_sequence[2]);
+    if (length > 0 && (size_t)length < sizeof(line)) (void)debug_console_send(line);
 }
 
 static void send_params(const chassis_control_t *chassis)
